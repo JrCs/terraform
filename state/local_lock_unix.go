@@ -4,38 +4,35 @@ package state
 
 import (
 	"fmt"
+	"log"
 	"os"
+	"syscall"
 )
 
-// We use a symlink lock technique for unix systems so that we aren't dependent
-// on filesystem settings or compatibility.
-func (s *LocalState) lock(reason string) error {
-	lockPath, lockInfoPath := s.lockPaths()
-
-	// Create the broken symlink first, because that's the atomic operation.
-	// Once we have a symlink, then we can fill in the info at our leisure.
-	err := os.Symlink(lockInfoPath, lockPath)
-	if err != nil {
-		if !os.IsExist(err) {
-			return fmt.Errorf("failed to lock state file %q: %s", s.Path, err)
-		}
-
-		// Read any info through the symlink path, in case it was a regular
-		// file created in windows.
-		lockInfo, err := s.lockInfo(lockPath)
-		if err != nil {
-			return err
-		}
-
-		// TODO: Should we automatically unlock after expiration?
-		//       This would align with lock implementations where the lock
-		//       disappears after expiration.
-		return lockInfo.Err()
+// use fcntl POSIX locks for the most consistent behavior across platforms, and
+// hopefully some campatibility over NFS and CIFS.
+func (s *LocalState) lock() error {
+	flock := &syscall.Flock_t{
+		Type:   syscall.F_RDLCK | syscall.F_WRLCK,
+		Whence: int16(os.SEEK_SET),
+		Start:  0,
+		Len:    0,
 	}
 
-	if err := s.writeLockInfo(reason, lockInfoPath); err != nil {
-		s.Unlock()
-		return err
+	fd := s.stateFile.Fd()
+	err := syscall.FcntlFlock(fd, syscall.F_SETLK, flock)
+	if err != nil {
+		lockInfo, err := s.lockInfo()
+		if err != nil {
+			// we can't get any lock info, at least get the PID if we can.
+			if err := syscall.FcntlFlock(fd, syscall.F_GETLK, flock); err != nil {
+				log.Fatalf("state file locked by pid: %d", flock.Pid)
+			}
+			// the error is only going to be "resource temporarily unavailable"
+			return fmt.Errorf("state file locked")
+		}
+
+		return lockInfo.Err()
 	}
 
 	return nil
